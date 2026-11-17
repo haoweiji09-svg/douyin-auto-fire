@@ -7,6 +7,10 @@ on:
         description: Only verify login and friends without sending
         type: boolean
         default: true
+      diagnostic_once:
+        description: One configured sticker attempt with no resend
+        type: boolean
+        default: false
   # 使用 GitHub Actions 的日程时把下面三行注释删掉；用外部 cron 不用管
   # schedule:
   #   - cron: "0 0 * * *"
@@ -126,6 +130,79 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
             python run.py --dry-run
+          elif [[ "${{ inputs.diagnostic_once }}" == "true" ]]; then
+            python - <<'DIAGNOSTIC'
+          """One configured sticker attempt; no resend, no trace or notification."""
+          import asyncio
+          from dataclasses import replace
+          import os
+          from pathlib import Path
+          
+          os.environ['TRACE'] = 'false'
+          for key in ('DINGTALK_WEBHOOK', 'DINGTALK_SECRET', 'WEBHOOK_URL', 'WEBHOOK_HEADERS', 'WEBHOOK_TEMPLATE'):
+              os.environ.pop(key, None)
+          
+          import app.main as runner
+          import app.sender as sender
+          from app.accounts import load_accounts
+          from app.douyin import PageOperationError
+          
+          if load_accounts() is not None:
+              raise SystemExit('Single diagnostic send requires single-account mode; nothing sent')
+          task = runner.load_task(runner.load_settings())
+          if len(task.targets) != 1 or len(task.targets[0].messages) != 1:
+              raise SystemExit('Single diagnostic send requires exactly one target and one message; nothing sent')
+          message = task.targets[0].messages[0]
+          if message.type != 'douyin_sticker' or message.sticker != '续火花':
+              raise SystemExit('Single diagnostic send only permits the configured 续火花 sticker; nothing sent')
+          sticker = task.stickers[message.sticker]
+          if (sticker.accessible_name or sticker.name) != '续火花':
+              raise SystemExit('Sticker label mismatch; nothing sent')
+          
+          task.stickers[message.sticker] = replace(sticker, fallback_index=None)
+          runner.load_task = lambda settings: task
+          
+          async def no_retry(*args):
+              return False
+          
+          sender._click_retry_on_latest_failed_message = no_retry
+          sender._publish_ready = no_retry
+          original = sender._await_send_terminal_state
+          
+          async def observe(page, scope, label, *args, **kwargs):
+              try:
+                  return await original(page, scope, label, *args, **kwargs)
+              except PageOperationError:
+                  # Inspect only the failed bubble's status marker and its tooltip.
+                  # Never inspect network traffic, auth state, trace, or other chats.
+                  for selector in sender.SEND_FAILURE_MARKERS:
+                      marker = scope.locator(selector).first
+                      if await marker.count() and await marker.is_visible():
+                          try:
+                              await marker.hover(timeout=2000)
+                              await page.wait_for_timeout(500)
+                              tooltips = page.get_by_role('tooltip')
+                              known = ('安全验证', '操作频繁', '网络异常', '网络错误', '发送失败', '重试', '风险', '未登录', '登录失效', '限制', '不支持', '版本', '客户端')
+                              texts = []
+                              for index in range(await tooltips.count()):
+                                  tip = tooltips.nth(index)
+                                  if await tip.is_visible():
+                                      texts.append(await tip.inner_text())
+                              for attribute in ('title', 'aria-label'):
+                                  texts.append(await marker.get_attribute(attribute) or '')
+                              # Log fixed diagnostic keywords only, never raw page text.
+                              found = [word for word in known if any(word in text for text in texts)]
+                              runner.LOGGER.error('Single attempt failure tooltip keywords: %s', ', '.join(found) or 'no specific tooltip')
+                              await page.screenshot(path='artifacts/single-attempt-failure.png')
+                          except Exception:
+                              runner.LOGGER.error('Could not inspect failure tooltip')
+                          break
+                  raise
+          
+          sender._await_send_terminal_state = observe
+          print('Guard passed: one target, one configured 续火花 sticker; retries disabled')
+          raise SystemExit(asyncio.run(runner.run(dry_run=False)))
+          DIAGNOSTIC
           else
             python run.py
           fi
