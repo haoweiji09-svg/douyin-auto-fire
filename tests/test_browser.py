@@ -171,8 +171,12 @@ async def test_risk_control_still_raises_before_search_check() -> None:
 async def test_login_required_still_raises_before_search_check() -> None:
     page = MagicMock()
     page.goto = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
 
-    with patch("app.browser._any_visible", new=AsyncMock(side_effect=[False, True])):
+    async def visible(_page, selectors, timeout_ms):
+        return selectors == LOGIN_REQUIRED_MARKERS
+
+    with patch("app.browser._any_visible", new=visible):
         with pytest.raises(AuthenticationError, match="登录状态失效"):
             await open_private_messages(page)
 
@@ -234,3 +238,44 @@ def test_ignores_cookie_editor_empty_name_artifact() -> None:
 def test_rejects_cookie_without_domain() -> None:
     with pytest.raises(ConfigError, match="缺少有效的 domain"):
         _normalize_cookies([{"name": "UIFID", "value": "token"}])
+
+
+@pytest.mark.asyncio
+async def test_transient_login_prompt_does_not_abort_authenticated_chat(caplog):
+    page = MagicMock()
+    page.goto = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+    prompt = iter([True, False])
+
+    async def visible(_page, selectors, timeout_ms):
+        return next(prompt) if selectors == LOGIN_REQUIRED_MARKERS else False
+
+    with patch("app.browser._any_visible", new=visible):
+        with patch("app.browser._first_visible_selector", new=AsyncMock(return_value='input[placeholder="搜索"]')):
+            with caplog.at_level(logging.INFO, logger="douyin_sender"):
+                await open_private_messages(page)
+    assert "临时登录提示已消失" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_login_confirmation_does_not_ignore_security_verification():
+    from app.browser import _login_required_persists
+    page = MagicMock()
+    page.wait_for_timeout = AsyncMock()
+    with patch("app.browser._any_visible", new=AsyncMock(side_effect=[True, True])):
+        with pytest.raises(RiskControlError):
+            await _login_required_persists(page)
+
+
+@pytest.mark.asyncio
+async def test_persistent_login_prompt_is_confirmed_for_full_window():
+    from app.browser import _login_required_persists
+    page = MagicMock()
+    page.wait_for_timeout = AsyncMock()
+
+    async def visible(_page, selectors, timeout_ms):
+        return selectors == LOGIN_REQUIRED_MARKERS
+
+    with patch("app.browser._any_visible", new=visible):
+        assert await _login_required_persists(page)
+    assert page.wait_for_timeout.await_count == 4
