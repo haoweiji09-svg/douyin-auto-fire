@@ -22,6 +22,7 @@ from app.models import Settings, TargetResult
 from app.notifier import send_dingtalk_notification, send_webhook_notification
 from app.privacy import RedactingFormatter, build_target_aliases, redact_text, target_alias
 from app.progress import create_single_run_progress
+from app.send_diagnostics import capture_send_diagnostics
 from app.sender import send_message
 
 
@@ -119,7 +120,8 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
                                 # 发送单条消息并计时
                                 msg_start = time.time()
                                 await verify_login(page, timeout_ms=3_000)
-                                await send_message(page, chat, message, task.stickers)
+                                async with capture_send_diagnostics(page):
+                                    await send_message(page, chat, message, task.stickers)
                                 msg_duration = time.time() - msg_start
                                 metrics.record_message_time(msg_duration)
 
