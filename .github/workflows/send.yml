@@ -6,7 +6,7 @@ on:
       dry_run:
         description: Only verify login and friends without sending
         type: boolean
-        default: false
+        default: true
   # 使用 GitHub Actions 的日程时把下面三行注释删掉；用外部 cron 不用管
   # schedule:
   #   - cron: "0 0 * * *"
@@ -23,8 +23,8 @@ jobs:
     permissions:
       contents: read
     env:
-      DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
-      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+      DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE || secrets.DOUYIN_COOKLE }}
+      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG || secrets.DOUTIN_CONFIG }}
       DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
       DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
@@ -38,9 +38,6 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
-      - name: Write protected configuration
-        shell: bash
-        run: printf '%s' "$DOUYIN_CONFIG" > config.json
       - name: Write multi-account configuration
         shell: bash
         env:
@@ -54,8 +51,8 @@ jobs:
           CONFIG_4: ${{ secrets.DOUYIN_CONFIG_ACCOUNT4 }}
           COOKIE_5: ${{ secrets.DOUYIN_COOKIE_ACCOUNT5 }}
           CONFIG_5: ${{ secrets.DOUYIN_CONFIG_ACCOUNT5 }}
-          LEGACY_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
-          LEGACY_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+          LEGACY_COOKIE: ${{ secrets.DOUYIN_COOKIE || secrets.DOUYIN_COOKLE }}
+          LEGACY_CONFIG: ${{ secrets.DOUYIN_CONFIG || secrets.DOUTIN_CONFIG }}
         run: |
           mkdir -p config/tasks
           python - <<'PY'
@@ -63,10 +60,26 @@ jobs:
           import os
           from pathlib import Path
 
-          if not any(os.environ.get(f"COOKIE_{i}") for i in range(1, 6)):
+          def task_config(value, secret_name):
+              if not value or not value.strip():
+                  raise SystemExit(f"{secret_name} 未配置或为空；请在 Actions Repository secrets 中添加任务 JSON")
+              try:
+                  parsed = json.loads(value.lstrip("\ufeff"))
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(
+                      f"{secret_name} 不是有效 JSON（第 {exc.lineno} 行，第 {exc.colno} 列）；"
+                      "请粘贴完整 JSON，不要填写文件名、Markdown 代码块或注释"
+                  ) from None
+              if not isinstance(parsed, dict):
+                  raise SystemExit(f"{secret_name} 必须是 JSON 对象，不能是数组或字符串")
+              return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+          if not any(os.environ.get(f"{kind}_{i}") for i in range(1, 6) for kind in ("COOKIE", "CONFIG")):
               # 没有配置任何多账号 Secret（DOUYIN_COOKIE_ACCOUNTn）：
               # 保持旧单账号模式，不生成 accounts.json。
-              print("未配置多账号 Secret，继续使用旧单账号模式")
+              config = task_config(os.environ.get("LEGACY_CONFIG"), "DOUYIN_CONFIG")
+              Path("config.json").write_text(config, encoding="utf-8")
+              print("DOUYIN_CONFIG JSON 校验通过，继续使用旧单账号模式")
               raise SystemExit(0)
 
           accounts = []
@@ -74,9 +87,11 @@ jobs:
               if index == 1 and not os.environ.get("COOKIE_1") and not os.environ.get("CONFIG_1"):
                   # 没有配置 DOUYIN_COOKIE_ACCOUNT1 时，旧版 DOUYIN_COOKIE /
                   # DOUYIN_CONFIG 自动作为账号1，方便老用户直接追加新账号。
+                  config_secret = "DOUYIN_CONFIG"
                   cookie = os.environ.get("LEGACY_COOKIE")
                   config = os.environ.get("LEGACY_CONFIG")
               else:
+                  config_secret = f"DOUYIN_CONFIG_ACCOUNT{index}"
                   cookie = os.environ.get(f"COOKIE_{index}")
                   config = os.environ.get(f"CONFIG_{index}")
               if not cookie and not config:
@@ -91,10 +106,7 @@ jobs:
                   json.loads(cookie)
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"DOUYIN_COOKIE_ACCOUNT{index} 不是有效 JSON: {exc}") from exc
-              try:
-                  json.loads(config)
-              except json.JSONDecodeError as exc:
-                  raise SystemExit(f"DOUYIN_CONFIG_ACCOUNT{index} 不是有效 JSON: {exc}") from exc
+              config = task_config(config, config_secret)
               env_file = f".env.account{index}"
               # Cookie 用 JSON 字符串转义后写入，dotenv 可精确还原，
               # 兼容多行 Cookie JSON 与 # 等特殊字符
