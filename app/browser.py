@@ -108,10 +108,29 @@ async def open_douyin(settings: Settings) -> AsyncIterator[BrowserSession]:
             await playwright.stop()
 
 
+async def _login_required_persists(page: Page) -> bool:
+    """Do not classify a transient SPA login prompt as expired credentials.
+
+    An explicit prompt must remain present for four successive seconds.
+    No credentials are read and security-verification prompts still stop the run.
+    """
+    if not await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+        return False
+    LOGGER.info("检测到登录提示，等待页面初始化后复核")
+    for _ in range(4):
+        await page.wait_for_timeout(1_000)
+        if await _any_visible(page, RISK_MARKERS, timeout_ms=500):
+            raise RiskControlError("抖音要求进行安全验证，任务已停止")
+        if not await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=500):
+            LOGGER.info("临时登录提示已消失，继续检查私信页面")
+            return False
+    return True
+
+
 async def verify_login(page: Page, timeout_ms: int = 15_000) -> None:
     if await _any_visible(page, RISK_MARKERS, timeout_ms=2_000):
         raise RiskControlError("抖音要求进行安全验证，任务已停止")
-    if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+    if await _login_required_persists(page):
         raise AuthenticationError("抖音登录状态已失效")
     if not await _any_visible(page, LOGIN_MARKERS, timeout_ms=timeout_ms):
         raise AuthenticationError("未检测到抖音私信页面，登录状态可能失效或页面结构已变化")
@@ -125,7 +144,7 @@ async def open_private_messages(page: Page, timeout_ms: int = 15_000) -> None:
     # 2. An explicit login page is the only signal that lets us attribute to
     #    expired credentials. Marker absence does not imply the credentials are
     #    valid, so search-box detection (steps 3/4) is kept separate.
-    if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+    if await _login_required_persists(page):
         raise AuthenticationError("进入抖音私信页面后登录状态失效")
 
     # 3. Detect the friend search box. The chat page is a SPA whose search box is
@@ -142,7 +161,7 @@ async def open_private_messages(page: Page, timeout_ms: int = 15_000) -> None:
         # appeared during the wait, so re-check before deciding to retry.
         if await _any_visible(page, RISK_MARKERS, timeout_ms=2_000):
             raise RiskControlError("抖音私信页面要求进行安全验证，任务已停止")
-        if await _any_visible(page, LOGIN_REQUIRED_MARKERS, timeout_ms=2_000):
+        if await _login_required_persists(page):
             raise AuthenticationError("进入抖音私信页面后登录状态失效")
         if attempt < SEARCH_BOX_RETRIES:
             LOGGER.warning("未检测到好友搜索框，第 %d/%d 次尝试，准备重试", attempt, SEARCH_BOX_RETRIES)
